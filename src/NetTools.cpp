@@ -1,17 +1,17 @@
 /**
  *  NetTools -- convenient wrappers for socket functions
- *  Copyright (C) 2017 Alex Harsanyi (AlexHarsanyi@gmail.com)
- * 
+ *  Copyright (C) 2017, 2018 Alex Harsanyi <AlexHarsanyi@gmail.com>
+ *
  * This program is free software: you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
  * more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
@@ -32,7 +32,7 @@ SOCKET tcp_listen(int port)
     if (r != 0 )
         throw Win32Error("WSAStartup()", r);
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
 
     if (s == INVALID_SOCKET)
         throw Win32Error("socket()", WSAGetLastError());
@@ -43,9 +43,16 @@ SOCKET tcp_listen(int port)
     if (r != 0)
         throw Win32Error("setsockopt(SO_REUSEADDR)", WSAGetLastError());
 
+    // Also accept IPv4 connections
+    BOOL v6only = FALSE;
+    r = setsockopt(s,  IPPROTO_IPV6, IPV6_V6ONLY,
+                   (char*)&v6only, sizeof(v6only));
+    if (r != 0)
+        throw Win32Error("setsockopt(IPV6_V6ONLY)", WSAGetLastError());
+
     struct addrinfo *result, hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_INET6;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
     hints.ai_flags = AI_PASSIVE;
@@ -86,10 +93,82 @@ SOCKET tcp_accept(SOCKET server)
     return client;
 }
 
+SOCKET tcp_connect (const std::string &server, int port)
+{
+    {
+        // Setup WinSock.  We can initialize WinSock as many time we like so
+        // we don't bother to check if it was already initialized.  We need at
+        // least version 2.2 of WinSock (MAKEWORD(2, 2))
+        WSADATA wsaData;
+        memset(&wsaData, 0, sizeof(wsaData));
+        HRESULT r = WSAStartup(MAKEWORD(2, 2), &wsaData);
+        if (r != 0 )
+            throw Win32Error("WSAStartup()", r);
+    }
+
+    std::ostringstream service_name;
+    service_name << port;
+
+    struct addrinfo hints;
+    memset (&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    // A host name can have multiple addresses, use getaddrinfo() to retrieve
+    // them all.
+    struct addrinfo *addresses;
+
+    int r = getaddrinfo (server.c_str(), service_name.str().c_str(), &hints, &addresses);
+    if (r != 0)
+        throw Win32Error ("getaddrinfo", WSAGetLastError());
+
+    // Try to connect using each returned address, return the first successful
+    // connection
+
+    for (struct addrinfo *a = addresses; a != NULL; a = a->ai_next)
+    {
+        SOCKET client = socket (a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (client == INVALID_SOCKET)
+        {
+            // The socket() call failed with parameters supplied by the
+            // getaddrinfo() call.  This is not a network issue and needs to
+            // be reported immediately.
+            throw Win32Error ("socket", WSAGetLastError());
+        }
+
+        r = connect (client, (struct sockaddr*)a->ai_addr, a->ai_addrlen);
+        if (r == SOCKET_ERROR)
+        {
+            // If this is the last address, throw an exception, otherwise try
+            // connecting to the next address.
+            if (a->ai_next == NULL)
+                throw Win32Error ("connect", WSAGetLastError());
+            else
+                continue;
+        }
+
+        // We have succeeded connecting to this socket, return it
+        freeaddrinfo (addresses);
+
+        // Disable send delay.
+        unsigned long flag = 1;
+        r = setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
+                       reinterpret_cast<const char*>(&flag), sizeof(flag));
+        if (r == SOCKET_ERROR)
+            throw Win32Error("setsockopt()", WSAGetLastError());
+
+        return client;
+    }
+
+    freeaddrinfo (addresses);
+    throw std::logic_error ("tcp_connect: cannot find suitable address");
+}
+
 std::string get_peer_name (SOCKET s)
 {
-    struct sockaddr_in addr;
-    int len = sizeof(struct sockaddr_in);
+    struct sockaddr_in6 addr;
+    int len = sizeof(struct sockaddr_in6);
     int r = getpeername(s, (struct sockaddr*)&addr, &len);
     if (r == SOCKET_ERROR)
     {
@@ -98,25 +177,28 @@ std::string get_peer_name (SOCKET s)
 
     char hostname[NI_MAXHOST];
     char servname[NI_MAXSERV];
-    r = getnameinfo ((struct sockaddr*)&addr, sizeof(struct sockaddr_in),
+    r = getnameinfo ((struct sockaddr*)&addr, sizeof(struct sockaddr_in6),
                      hostname, NI_MAXHOST,
                      servname, NI_MAXSERV,
                      NI_NUMERICSERV);
+    char address[50];
+    InetNtopA(AF_INET6, &addr, &address[0], sizeof(address));
+
     if (r == 0) // success
     {
         std::ostringstream n;
-        n << hostname << " at " << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port);
+        n << hostname << " at " << address << ":" << ntohs(addr.sin6_port);
         return n.str();
     }
     else
     {
         std::ostringstream n;
-        n << inet_ntoa(addr.sin_addr) << ":" << ntohs(addr.sin_port);
+        n << address << ":" << ntohs(addr.sin6_port);
         return n.str();
     }
 }
 
-// timeout in milliseconds
+// NOTE: timeout is in milliseconds
 std::vector<uint8_t> get_socket_status(const std::vector<SOCKET> &sockets, uint64_t timeout)
 {
     if (sockets.size() >= FD_SETSIZE)
