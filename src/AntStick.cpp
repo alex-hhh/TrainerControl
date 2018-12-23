@@ -1,17 +1,17 @@
 /**
  *  AntStick -- communicate with an ANT+ USB stick
- *  Copyright (C) 2017 Alex Harsanyi (AlexHarsanyi@gmail.com)
- * 
+ *  Copyright (C) 2017, 2018 Alex Harsanyi <AlexHarsanyi@gmail.com>
+ *
  * This program is free software: you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the Free
  *  Software Foundation, either version 3 of the License, or (at your option)
  *  any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
  * more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
@@ -24,14 +24,16 @@
 #include <iterator>
 #include <assert.h>
 
+#include <chrono>
+
 #include "winsock2.h" // for struct timeval
 
 #ifdef WIN32
 #pragma comment (lib, "libusb-1.0.lib")
 #endif
 
-/** IMPLEMENTATION NOTE 
- * 
+/** IMPLEMENTATION NOTE
+ *
  * The ANT Message Protocol implemented here is documented in the "ANT Message
  * Protocol And Usage" document available from https://www.thisisant.com/
  *
@@ -61,7 +63,12 @@ enum ChannelType {
 void CheckChannelResponse (
     const Buffer &response, uint8_t channel, uint8_t cmd, uint8_t status)
 {
-    if (response[2] != CHANNEL_RESPONSE
+    if (response.size() < 5)
+    {
+        if (! std::uncaught_exception())
+            throw std::runtime_error ("CheckChannelResponse: short response");
+    }
+    else if (response[2] != CHANNEL_RESPONSE
         || response[3] != channel
         || response[4] != cmd
         || response[5] != status)
@@ -74,7 +81,7 @@ void CheckChannelResponse (
         // Funny thing: this function is also called from a destructor while
         // an exception is being unwound.  Don't cause further trouble...
         if (! std::uncaught_exception())
-            throw std::runtime_error ("CheckChannelResponse -- bad response");
+            throw std::runtime_error ("CheckChannelResponse: bad response");
     }
 }
 
@@ -284,10 +291,11 @@ AntMessageReader::AntMessageReader (libusb_device_handle *dh, uint8_t endpoint)
 
 AntMessageReader::~AntMessageReader()
 {
-    if (m_Active)
+    if (m_Active) {
         libusb_cancel_transfer (m_Transfer);
+    }
     while (m_Active) {
-        libusb_handle_events (nullptr);
+        libusb_handle_events(nullptr);
     }
     libusb_free_transfer (m_Transfer);
 }
@@ -301,18 +309,18 @@ void AntMessageReader::MaybeGetNextMessage (Buffer &message)
     message.clear();
 
     if (m_Active) {
-        // Finish the transfer, wait 2 seconds for it
         struct timeval tv;
-        tv.tv_sec = 2; tv.tv_usec = 0;
+        tv.tv_sec = 0;
+        tv.tv_usec = 10 * 1000;
         int r = libusb_handle_events_timeout_completed (nullptr, &tv, nullptr);
         if (r < 0)
-            throw LibusbError ("libusb_handle_events", r);
+            throw LibusbError ("libusb_handle_events_timeout_completed", r);
     }
 
-    if (m_Active)
-        return;
-
-    GetNextMessage1(message);
+    if(! m_Active) {
+        // a transfer was completed, see if we have a full message.
+        GetNextMessage1(message);
+    }
 }
 
 
@@ -324,14 +332,23 @@ void AntMessageReader::MaybeGetNextMessage (Buffer &message)
 void AntMessageReader::GetNextMessage(Buffer &message)
 {
     MaybeGetNextMessage(message);
+    int tries = 100;
+    while (message.empty() && tries > 0)
+    {
+        MaybeGetNextMessage(message);
+        tries--;
+    }
     if (message.empty())
-        throw std::runtime_error ("AntMessageReader -- timed out");
+        throw std::runtime_error ("AntMessageReader::GetNextMessage: timed out");
 }
 
 void AntMessageReader::GetNextMessage1(Buffer &message)
 {
     // Cannot operate on the buffer while a transfer is active
     assert (! m_Active);
+
+    // In case the CompleteUsbTransfer was not called...
+    m_Buffer.erase(m_Buffer.begin() + m_Mark, m_Buffer.end());
 
     // Look for the sync byte which starts a message
     while ((! m_Buffer.empty()) && m_Buffer[0] != SYNC_BYTE) {
@@ -360,7 +377,7 @@ void AntMessageReader::GetNextMessage1(Buffer &message)
     m_Mark -= len;
 
     if (! IsGoodChecksum (message))
-        throw std::runtime_error ("AntMessageReader -- bad checksum");
+        throw std::runtime_error ("AntMessageReader::GetNextMessage1: bad checksum");
 }
 
 void LIBUSB_CALL AntMessageReader::Trampoline (libusb_transfer *t)
@@ -392,15 +409,17 @@ void AntMessageReader::SubmitUsbTransfer()
 
 void AntMessageReader::CompleteUsbTransfer(const libusb_transfer *t)
 {
-    assert (t == m_Transfer);
+    assert(t == m_Transfer);
 
     m_Active = false;
 
-    bool ok = (m_Transfer->status == LIBUSB_TRANSFER_COMPLETED);
+    if (m_Transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+        m_Mark += m_Transfer->actual_length;
+    }
 
-    m_Mark += ok ? m_Transfer->actual_length : 0;
-    m_Buffer.erase (m_Buffer.begin() + m_Mark, m_Buffer.end());
+    m_Buffer.erase(m_Buffer.begin() + m_Mark, m_Buffer.end());
 }
+
 
 
 // ................................................... AntMessageWriter ....
@@ -417,8 +436,9 @@ public:
 private:
 
     static void LIBUSB_CALL Trampoline (libusb_transfer *);
-    void SubmitUsbTransfer();
+    void SubmitUsbTransfer(const Buffer &message, int timeout);
     void CompleteUsbTransfer(const libusb_transfer *);
+    void WaitForCompletion(int timeout);
 
     libusb_device_handle *m_DeviceHandle;
     uint8_t m_Endpoint;
@@ -437,11 +457,10 @@ AntMessageWriter::AntMessageWriter (libusb_device_handle *dh, uint8_t endpoint)
 
 AntMessageWriter::~AntMessageWriter()
 {
-    if (m_Active)
+    if (m_Active) {
         libusb_cancel_transfer (m_Transfer);
-    while (m_Active) {
-        libusb_handle_events (nullptr);
     }
+    WaitForCompletion(2000);
     libusb_free_transfer (m_Transfer);
 }
 
@@ -453,31 +472,25 @@ AntMessageWriter::~AntMessageWriter()
 void AntMessageWriter::WriteMessage (const Buffer &message)
 {
     assert (! m_Active);
-    m_Buffer = message;
-    m_Active = false;
-    SubmitUsbTransfer();
+    SubmitUsbTransfer(message, 2000 /* milliseconds */);
+    WaitForCompletion(2000 /* milliseconds */);
 
-    // Finish the transfer, wait 2 seconds for it
-    struct timeval tv;
-    tv.tv_sec = 2; tv.tv_usec = 0;
-    int r = libusb_handle_events_timeout_completed (nullptr, &tv, nullptr);
-    if (r < 0)
-        throw LibusbError ("libusb_handle_events", r);
+    if (m_Transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+        m_Active = false; // sometimes CompleteUsbTransfer() is not called, not sure why...
+    }
 
-    if (! m_Active && m_Transfer->status != LIBUSB_TRANSFER_COMPLETED)
-        throw LibusbError ("AntMessageWriter", m_Transfer->status);
+    if (m_Active || m_Transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+        m_Active = false;
+        int r = 0;
 
-    if (m_Active) {
-        libusb_cancel_transfer (m_Transfer);
-        struct timeval tv;
-        tv.tv_sec = 0; tv.tv_usec = 10 * 1000;
-        int r = libusb_handle_events_timeout_completed (nullptr, &tv, nullptr);
-        if (r < 0)
-            throw LibusbError ("libusb_handle_events", r);
+        if (m_Transfer->status == LIBUSB_TRANSFER_STALL) {
+            r = libusb_clear_halt(m_DeviceHandle, m_Endpoint);
+            if (r < 0) {
+                throw LibusbError("libusb_clear_halt", r);
+            }
+        }
 
-        m_Active = false;               // ready or not!
-
-        throw std::runtime_error ("AntMessageWriter -- timed out");
+        throw LibusbError("AntMessageReader", m_Transfer->status);
     }
 }
 
@@ -487,9 +500,9 @@ void LIBUSB_CALL AntMessageWriter::Trampoline (libusb_transfer *t)
     a->CompleteUsbTransfer (t);
 }
 
-void AntMessageWriter::SubmitUsbTransfer()
+void AntMessageWriter::SubmitUsbTransfer(const Buffer &message, int timeout)
 {
-    const int timeout = 2000;
+    m_Buffer = message;
 
     libusb_fill_bulk_transfer (
         m_Transfer, m_DeviceHandle, m_Endpoint,
@@ -508,6 +521,31 @@ void AntMessageWriter::CompleteUsbTransfer(const libusb_transfer *t)
     m_Active = false;
 }
 
+void AntMessageWriter::WaitForCompletion(int timeout)
+{
+    using namespace std::chrono;
+
+    struct timeval tv;
+    tv.tv_sec = timeout / 1000;
+    tv.tv_usec = (timeout - tv.tv_sec * 1000) * 1000;
+    auto start = high_resolution_clock::now();
+    milliseconds accumulated;
+
+    // NOTE: libusb_handle_events and friends will handle all USB events, but
+    // not necessarily our event, as such they might return before our
+    // transfer is complete.  We wait repeatedly until our event is complete
+    // or 'timeout' milliseconds have passed.
+
+    while (m_Active && accumulated.count() < timeout)
+    {
+        int r = libusb_handle_events_timeout_completed (nullptr, &tv, nullptr);
+        if (r < 0)
+            throw LibusbError ("libusb_handle_events_timeout_completed", r);
+        auto now = high_resolution_clock::now();
+        accumulated = duration_cast<milliseconds>(now - start);
+    }
+}
+
 
 // ......................................................... AntChannel ....
 
@@ -519,12 +557,14 @@ AntChannel::AntChannel (AntStick *stick,
     : m_Stick (stick),
       m_IdReqestOutstanding (false),
       m_AckDataRequestOutstanding(false),
-      m_ChannelId(channel_id)
+      m_ChannelId(channel_id),
+      m_MessagesReceived(0),
+      m_MessagesFailed(0)
 {
     m_ChannelNumber = stick->NextChannelId();
 
     if (m_ChannelNumber == -1)
-        throw std::runtime_error("no more channel ids left");
+        throw std::runtime_error("AntChannel: no more channel ids left");
 
     // we hard code the type to BIDIRECTIONAL_RECEIVE, using other channel
     // types would require changes to the handling code anyway.
@@ -533,7 +573,7 @@ AntChannel::AntChannel (AntStick *stick,
             ASSIGN_CHANNEL, m_ChannelNumber,
             static_cast<uint8_t>(BIDIRECTIONAL_RECEIVE),
             static_cast<uint8_t>(m_Stick->GetNetwork())));
-    Buffer response = m_Stick->ReadMessage();
+    Buffer response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, ASSIGN_CHANNEL, 0);
 
     m_Stick->WriteMessage(
@@ -544,14 +584,14 @@ AntChannel::AntChannel (AntStick *stick,
                     // High nibble of the transmission_type is the top 4 bits
                     // of the 20 bit device id.
                     static_cast<uint8_t>((m_ChannelId.DeviceNumber >> 12) & 0xF0)));
-    response = m_Stick->ReadMessage();
+    response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, SET_CHANNEL_ID, 0);
 
     Configure(period, timeout, frequency);
 
     m_Stick->WriteMessage (
         MakeMessage (OPEN_CHANNEL, m_ChannelNumber));
-    response = m_Stick->ReadMessage();
+    response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, OPEN_CHANNEL, 0);
 
     m_State = CH_SEARCHING;
@@ -565,7 +605,7 @@ AntChannel::~AntChannel()
         // now, but this might fail.
         if (m_State != CH_CLOSED) {
             m_Stick->WriteMessage (MakeMessage (CLOSE_CHANNEL, m_ChannelNumber));
-            Buffer response = m_Stick->ReadMessage();
+            Buffer response = m_Stick->ReadInternalMessage();
             CheckChannelResponse (response, m_ChannelNumber, CLOSE_CHANNEL, 0);
 
             // The channel has to respond with an EVENT_CHANNEL_CLOSED channel
@@ -574,7 +614,7 @@ AntChannel::~AntChannel()
             Sleep(0);
 
             m_Stick->WriteMessage (MakeMessage (UNASSIGN_CHANNEL, m_ChannelNumber));
-            response = m_Stick->ReadMessage();
+            response = m_Stick->ReadInternalMessage();
             CheckChannelResponse (response, m_ChannelNumber, UNASSIGN_CHANNEL, 0);
         }
     }
@@ -592,7 +632,7 @@ AntChannel::~AntChannel()
 void AntChannel::RequestClose()
 {
     m_Stick->WriteMessage (MakeMessage (CLOSE_CHANNEL, m_ChannelNumber));
-    Buffer response = m_Stick->ReadMessage();
+    Buffer response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, CLOSE_CHANNEL, 0);
 }
 
@@ -625,17 +665,17 @@ void AntChannel::Configure (unsigned period, uint8_t timeout, uint8_t frequency)
 {
     m_Stick->WriteMessage (
         MakeMessage (SET_CHANNEL_PERIOD, m_ChannelNumber, period & 0xFF, (period >> 8) & 0xff));
-    Buffer response = m_Stick->ReadMessage();
+    Buffer response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, SET_CHANNEL_PERIOD, 0);
 
     m_Stick->WriteMessage (
         MakeMessage (SET_CHANNEL_SEARCH_TIMEOUT, m_ChannelNumber, timeout));
-    response = m_Stick->ReadMessage();
+    response = m_Stick->ReadInternalMessage();
     CheckChannelResponse (response, m_ChannelNumber, SET_CHANNEL_SEARCH_TIMEOUT, 0);
 
     m_Stick->WriteMessage (
         MakeMessage (SET_CHANNEL_RF_FREQ, m_ChannelNumber, frequency));
-    response = m_Stick->ReadMessage();
+    response = m_Stick->ReadInternalMessage();
     CheckChannelResponse(response, m_ChannelNumber, SET_CHANNEL_RF_FREQ, 0);
 }
 
@@ -671,6 +711,7 @@ void AntChannel::HandleMessage(const uint8_t *data, int size)
         }
         MaybeSendAckData();
         OnMessageReceived(data, size);
+        m_MessagesReceived++;
         break;
     case RESPONSE_CHANNEL_ID:
         OnChannelIdMessage (data, size);
@@ -706,8 +747,11 @@ void AntChannel::OnChannelResponseMessage (const uint8_t *data, int size)
     // expect chanel responses here
     if (msg_id == 1)
     {
+        if (event == EVENT_RX_FAIL)
+            m_MessagesFailed++;
+
         if (event == EVENT_RX_SEARCH_TIMEOUT) {
-            // ignore it, we are closed, but we need to wait for the closed 
+            // ignore it, we are closed, but we need to wait for the closed
             // message
         }
         else if (event == EVENT_CHANNEL_CLOSED) {
@@ -715,7 +759,7 @@ void AntChannel::OnChannelResponseMessage (const uint8_t *data, int size)
             if (m_State != CH_CLOSED) {
                 ChangeState(CH_CLOSED);
                 m_Stick->WriteMessage(MakeMessage(UNASSIGN_CHANNEL, m_ChannelNumber));
-                Buffer response = m_Stick->ReadMessage();
+                Buffer response = m_Stick->ReadInternalMessage();
                 CheckChannelResponse(response, m_ChannelNumber, UNASSIGN_CHANNEL, 0);
             }
             return;
@@ -759,10 +803,12 @@ void AntChannel::OnChannelIdMessage (const uint8_t *data, int size)
 {
     assert(data[2] == RESPONSE_CHANNEL_ID);
 
-    // we asked for this when we received the first broadcast message on
-    // the channel
+    // we asked for this when we received the first broadcast message on the
+    // channel.  Normally this would be a logic error in the program (and
+    // therefore it should be an assert(), but this is a packet we received
+    // from the AntStick...)
     if (data[3] != m_ChannelNumber) {
-        throw std::runtime_error ("unexpected channel number");
+        throw std::runtime_error ("AntChannel::OnChannelIdMessage: unexpected channel number");
     }
 
     auto transmission_type = static_cast<TransmissionType>(data[7] & 0x03);
@@ -776,7 +822,7 @@ void AntChannel::OnChannelIdMessage (const uint8_t *data, int size)
     } else if (m_ChannelId.DeviceType != device_type) {
         // we seem to have paired up with a different device type than we
         // asked for...
-        throw std::runtime_error ("unexpected device type");
+        throw std::runtime_error ("AntChannel::OnChannelIdMessage: unexpected device type");
     }
 
     if (m_ChannelId.DeviceNumber == 0) {
@@ -784,7 +830,7 @@ void AntChannel::OnChannelIdMessage (const uint8_t *data, int size)
     } else if (m_ChannelId.DeviceNumber != device_number) {
         // we seem to have paired up with a different device than we asked
         // for...
-        throw std::runtime_error ("unexpected device number");
+        throw std::runtime_error ("AntChannel::OnChannelIdMessage: unexpected device number");
     }
 
     // NOTE: fist channel id responses might not contain a message ID.
@@ -848,14 +894,14 @@ int num_ant_stick_devid = sizeof(ant_stick_devid) / sizeof(ant_stick_devid[0]);
 /** Find the USB device for the ANT stick.  Return nullptr if not found,
  * throws an exception if there is a problem with the lookup.
  */
-libusb_device* FindAntStick()
+libusb_device_handle* FindAntStick()
 {
     libusb_device **devs;
     ssize_t devcnt = libusb_get_device_list(nullptr, &devs);
     if (devcnt < 0)
         throw LibusbError("libusb_get_device_list", devcnt);
 
-    libusb_device *ant_stick = nullptr; // the one we are looking for
+    libusb_device_handle *ant_stick = nullptr; // the one we are looking for
     bool found_it = false;
     int i = 0;
     libusb_device *dev = nullptr;
@@ -874,8 +920,11 @@ libusb_device* FindAntStick()
             if (desc.idVendor == ant_stick_devid[i].vid
                 && desc.idProduct == ant_stick_devid[i].pid)
             {
-                ant_stick = dev;
-                libusb_ref_device(ant_stick);
+                int r = libusb_open(dev, &ant_stick);
+                if (r < 0)
+                {
+                    throw LibusbError("libusb_open", r);
+                }
                 found_it = true;
                 break;
             }
@@ -894,7 +943,7 @@ void ConfigureAntStick(libusb_device_handle *ant_stick)
     if (r < 0)
         throw LibusbError("libusb_claim_interface", r);
 
-    int actual_config;
+    int actual_config = 0;
     int desired_config = 1; // ant sticks support only one configuration
     r = libusb_get_configuration(ant_stick, &actual_config);
     if (r < 0)
@@ -902,9 +951,21 @@ void ConfigureAntStick(libusb_device_handle *ant_stick)
 
     if (actual_config != desired_config)
     {
+        // According to libusb documentation, we cannot change the
+        // configuration if the application has claimed interfaces.
+        r = libusb_release_interface(ant_stick, 0);
+        if (r < 0)
+            throw LibusbError("libusb_release_interface", r);
+
+        std::cerr << "libusb_set_configuration actual = " << actual_config
+                  << ", desired = " << desired_config << "\n";
         r = libusb_set_configuration(ant_stick, desired_config);
         if (r < 0)
             throw LibusbError("libusb_set_configuration", r);
+
+        r = libusb_claim_interface(ant_stick, 0); // Interface 0 must always exist
+        if (r < 0)
+            throw LibusbError("libusb_claim_interface", r);
     }
     r = libusb_reset_device(ant_stick);
     if (r < 0)
@@ -926,12 +987,12 @@ void GetAntStickReadWriteEndpoints(
     try {
         if (cdesc->bNumInterfaces != 1)
         {
-            throw std::runtime_error("unexpected number of interfaces");
+            throw std::runtime_error("GetAntStickReadWriteEndpoints: unexpected number of interfaces");
         }
         const libusb_interface *i = cdesc->interface;
         if (i->num_altsetting != 1)
         {
-            throw std::runtime_error("unexpected number of alternate settings");
+            throw std::runtime_error("GetAntStickReadWriteEndpoints: unexpected number of alternate settings");
         }
         const libusb_interface_descriptor *idesc = i->altsetting;
 
@@ -963,8 +1024,7 @@ void GetAntStickReadWriteEndpoints(
 }
 
 AntStick::AntStick()
-    : m_Device (nullptr),
-      m_DeviceHandle (nullptr),
+    : m_DeviceHandle (nullptr),
       m_SerialNumber (0),
       m_Version (""),
       m_MaxNetworks (-1),
@@ -972,23 +1032,34 @@ AntStick::AntStick()
       m_Network(-1)
 {
     try {
-        m_Device = FindAntStick();
-        if (! m_Device)
+        m_DeviceHandle = FindAntStick();
+        if (! m_DeviceHandle)
         {
             throw AntStickNotFound();
         }
-        int r = libusb_open(m_Device, &m_DeviceHandle);
-        if (r < 0)
-        {
-            m_DeviceHandle = nullptr;
-            throw LibusbError("libusb_open", r);
-        }
+
+        // Not needed on Windows, but harmless and needed on Linux.  Don't
+        // check return code, as we don't care about it.
+        libusb_set_auto_detach_kernel_driver(m_DeviceHandle, 1);
+
         ConfigureAntStick(m_DeviceHandle);
 
         uint8_t read_endpoint, write_endpoint;
 
+        auto *device = libusb_get_device(m_DeviceHandle);
+
         GetAntStickReadWriteEndpoints(
-            m_Device, &read_endpoint, &write_endpoint);
+            device, &read_endpoint, &write_endpoint);
+
+        int r = libusb_clear_halt(m_DeviceHandle, read_endpoint);
+        if (r < 0) {
+            throw LibusbError("libusb_clear_halt(read_endpoint)", r);
+        }
+
+        r = libusb_clear_halt(m_DeviceHandle, write_endpoint);
+        if (r < 0) {
+            throw LibusbError("libusb_clear_halt(write_endpoint)", r);
+        }
 
         auto rt = std::unique_ptr<AntMessageReader>(
             new AntMessageReader (m_DeviceHandle, read_endpoint));
@@ -1010,7 +1081,6 @@ AntStick::AntStick()
         m_Writer = std::move (std::unique_ptr<AntMessageWriter>());
         if (m_DeviceHandle)
             libusb_close(m_DeviceHandle);
-        libusb_unref_device(m_Device);
         throw;
     }
 }
@@ -1019,8 +1089,9 @@ AntStick::~AntStick()
 {
     m_Reader = std::move (std::unique_ptr<AntMessageReader>());
     m_Writer = std::move (std::unique_ptr<AntMessageWriter>());
-    libusb_close(m_DeviceHandle);
-    libusb_unref_device(m_Device);
+    if (m_DeviceHandle) {
+        libusb_close(m_DeviceHandle);
+    }
 }
 
 void AntStick::WriteMessage(const Buffer &b)
@@ -1028,7 +1099,12 @@ void AntStick::WriteMessage(const Buffer &b)
     m_Writer->WriteMessage (b);
 }
 
-const Buffer& AntStick::ReadMessage()
+/** Read a message from the ANT stick and return it.  This is used only for
+ * reading messages indented for the ANT stick and channel management and any
+ * broadcast and other messages are queued up so they will be correctly
+ * processed by AntStick::Tick()
+ */
+const Buffer& AntStick::ReadInternalMessage()
 {
     auto SetAsideMessage = [] (const Buffer &message) -> bool {
         return (message[2] == BROADCAST_DATA
@@ -1038,46 +1114,76 @@ const Buffer& AntStick::ReadMessage()
                         message[4] == ACKNOWLEDGE_DATA ||
                         message[4] == BURST_TRANSFER_DATA)));
     };
-    
-    for(;;) {
+
+    for(int i = 0; i < 50; ++i) {
         m_Reader->GetNextMessage(m_LastReadMessage);
         if (SetAsideMessage(m_LastReadMessage))
             m_DelayedMessages.push(m_LastReadMessage);
         else
             return m_LastReadMessage;
     }
+
+    m_LastReadMessage.clear();
+    return m_LastReadMessage;
 }
 
+/** Reset the ANT stick by sending it a reset command.  Also discard any
+ * queued up messages, so we don't process anything from the previous ANT
+ * Stick user.
+ */
 void AntStick::Reset()
 {
-    WriteMessage (MakeMessage (RESET_SYSTEM, 0));
-    int ntries = 50;
-    while (ntries-- > 0) {
-        Buffer message = ReadMessage();
-        if(message[2] == STARTUP_MESSAGE)
-            break;
+    // At least my AntStick dongle occasionally "forgets" to send a
+    // STARTUP_MESSAGE after a RESET_SYSTEM, however, the system appears to
+    // work fine.  It is unclear if the system is reset but the startup
+    // message is not sent or if the system is not reset at all.
+
+    try {
+        WriteMessage(MakeMessage(RESET_SYSTEM, 0));
+        int ntries = 50;
+        while (ntries-- > 0) {
+            Buffer message = ReadInternalMessage();
+            if(message.size() >= 2 && message[2] == STARTUP_MESSAGE) {
+                std::swap(m_DelayedMessages, std::queue<Buffer>());
+                return;
+            }
+        }
     }
+    catch (const std::exception &) {
+        // Discard any exceptions for the reset message (there are timeouts
+        // from the message reader)
+    }
+
+#ifdef DEBUG_OUTPUT
+    std::cerr << "AntStick::Reset() -- did not receive STARTUP_MESSAGE\n";
+#endif
+
+    // throw std::runtime_error("AntStick::Reset: failed to receive startup message");
 }
 
+
+/** Query basic information from the ANT Stick, such as the serial number,
+ * version, maximum networks and channels that it supports.
+ */
 void AntStick::QueryInfo()
 {
     WriteMessage (MakeMessage (REQUEST_MESSAGE, 0, RESPONSE_SERIAL_NUMBER));
-    Buffer msg_serial = ReadMessage();
+    Buffer msg_serial = ReadInternalMessage();
     if (msg_serial[2] != RESPONSE_SERIAL_NUMBER)
-        throw std::runtime_error ("QueryInfo: unexpected message");
+        throw std::runtime_error ("AntStick::QueryInfo: unexpected message");
     m_SerialNumber = msg_serial[3] | (msg_serial[4] << 8) | (msg_serial[5] << 16) | (msg_serial[6] << 24);
 
     WriteMessage (MakeMessage (REQUEST_MESSAGE, 0, RESPONSE_VERSION));
-    Buffer msg_version = ReadMessage();
+    Buffer msg_version = ReadInternalMessage();
     if (msg_version[2] != RESPONSE_VERSION)
-        throw std::runtime_error ("QueryInfo: unexpected message");
+        throw std::runtime_error ("AntStick::QueryInfo: unexpected message");
     const char *version = reinterpret_cast<const char *>(&msg_version[3]);
     m_Version = version;
 
     WriteMessage (MakeMessage (REQUEST_MESSAGE, 0, RESPONSE_CAPABILITIES));
-    Buffer msg_caps = ReadMessage();
+    Buffer msg_caps = ReadInternalMessage();
     if (msg_caps[2] != RESPONSE_CAPABILITIES)
-        throw std::runtime_error ("QueryInfo: unexpected message");
+        throw std::runtime_error ("AntStick::QueryInfo: unexpected message");
 
     m_MaxChannels = msg_caps[3];
     m_MaxNetworks = msg_caps[4];
@@ -1098,8 +1204,8 @@ int AntStick::NextChannelId() const
 {
     int id = 0;
     for (int i = 0; i < m_MaxChannels; ++i) {
-        for (auto j = begin(m_Channels); j != end(m_Channels); j++) {
-            if ((*j)->m_ChannelNumber == i)
+        for (auto j : m_Channels) {
+            if (j->m_ChannelNumber == i)
                 goto next;
         }
         return i;
@@ -1111,14 +1217,16 @@ int AntStick::NextChannelId() const
 
 void AntStick::SetNetworkKey (uint8_t key[8])
 {
-    uint8_t network = 0;          // always open network 0 for now
+    // Currently, only one network use is supported, so always use network id
+    // 0 for now
+    uint8_t network = 0;
 
     m_Network = -1;
     Buffer nkey;
     nkey.push_back (network);
     nkey.insert (nkey.end(), &key[0], &key[8]);
     WriteMessage (MakeMessage (SET_NETWORK_KEY, nkey));
-    Buffer response = ReadMessage();
+    Buffer response = ReadInternalMessage();
     CheckChannelResponse (response, network, SET_NETWORK_KEY, 0);
     m_Network = network;
 }
@@ -1130,10 +1238,9 @@ bool AntStick::MaybeProcessMessage(const Buffer &message)
     if (message[2] == BURST_TRANSFER_DATA)
         channel = message[3] & 0x1f;
 
-    for(auto i = m_Channels.begin(); i != m_Channels.end(); ++i) {
-        if ((*i)->m_ChannelNumber == channel)
-        {
-            (*i)->HandleMessage (&message[0], message.size());
+    for(auto ch : m_Channels) {
+        if (ch->m_ChannelNumber == channel) {
+            ch->HandleMessage (&message[0], message.size());
             return true;
         }
     }
@@ -1172,8 +1279,8 @@ void TickAntStick(AntStick *s)
     s->Tick();
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 1000;
-    int r = libusb_handle_events_timeout_completed(nullptr, &tv, nullptr);
+    tv.tv_usec = 10 * 1000;
+    int r = libusb_handle_events_timeout_completed (nullptr, &tv, nullptr);
     if (r < 0)
-        throw LibusbError("libusb_handle_events", r);
+        throw LibusbError("libusb_handle_events_timeout_completed", r);
 }

@@ -1,6 +1,6 @@
 /**
  *  AntStick -- communicate with an ANT+ USB stick
- *  Copyright (C) 2017 Alex Harsanyi (AlexHarsanyi@gmail.com)
+ *  Copyright (C) 2017, 2018 Alex Harsanyi <AlexHarsanyi@gmail.com>
  * 
  * This program is free software: you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the Free
@@ -206,6 +206,8 @@ public:
     void RequestClose();
     State ChannelState() const { return m_State; }
     Id ChannelId() const { return m_ChannelId; }
+    int MessagesReceived() const { return m_MessagesReceived; }
+    int MessagesFailed() const { return m_MessagesFailed; }
 
 protected:
     /* Derived classes can use these methods. */
@@ -289,6 +291,15 @@ private:
 
     AntStick *m_Stick;
 
+    /** Number of broadcast messages received (the broadcast messages contain
+     * useful data from the sensors).
+     */
+    int m_MessagesReceived;
+
+    /** Number of times we failed to receive a message.
+     */
+    int m_MessagesFailed;
+
     void Configure (unsigned period, uint8_t timeout, uint8_t frequency);
     void HandleMessage(const uint8_t *data, int size);
     void MaybeSendAckData();
@@ -337,14 +348,14 @@ public:
     int GetMaxChannels() const { return m_MaxChannels; }
     int GetNetwork() const { return m_Network; }
 
-    void WriteMessage(const Buffer &b);
-    const Buffer& ReadMessage();
-
     void Tick();
 
     static uint8_t g_AntPlusNetworkKey[8];
 
 private:
+
+    void WriteMessage(const Buffer &b);
+    const Buffer& ReadInternalMessage();
 
     void Reset();
     void QueryInfo();
@@ -354,7 +365,6 @@ private:
 
     bool MaybeProcessMessage(const Buffer &message);
 
-    libusb_device *m_Device;
     libusb_device_handle *m_DeviceHandle;
 
     unsigned m_SerialNumber;
