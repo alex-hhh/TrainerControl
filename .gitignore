@@ -32,3 +32,5 @@ Thumbs.db.meta
 *.exe
 *.ilk
 Debug/
+Release/
+x86/
