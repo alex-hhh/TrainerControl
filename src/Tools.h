@@ -41,7 +41,7 @@ public:
     virtual ~LibusbError();
 
     const char* what() const /*noexcept(true)*/;
-    int error_code() { return m_ErrorCode; }
+    int error_code() const { return m_ErrorCode; }
 
 private:
     std::string m_Who;

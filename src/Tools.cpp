@@ -75,13 +75,13 @@ const char* Win32Error::what() const
     if (! m_MessageDone) {
         LPVOID buf = NULL;
 
-        FormatMessage(
+        FormatMessageA(
             FORMAT_MESSAGE_ALLOCATE_BUFFER |
             FORMAT_MESSAGE_FROM_SYSTEM,
             NULL,
             m_ErrorCode,
             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            (LPTSTR) &buf,
+            (LPSTR) &buf,
             0, NULL );
 
         // remove the newline from the end
@@ -94,7 +94,7 @@ const char* Win32Error::what() const
         msg << m_Who << " error " << m_ErrorCode << ": " << (char*)buf;
         m_Message = msg.str();
         LocalFree(buf);
-        m_Message = true;
+        m_MessageDone = true;
     }
 
     return m_Message.c_str();
